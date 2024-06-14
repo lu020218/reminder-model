@@ -6,6 +6,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <vector>
 
 class TaskScheduler {
 public:
@@ -25,11 +26,14 @@ public:
         }
     }
 
-    void remove_task(const std::chrono::system_clock::time_point& time) {
+    void remove_task(const std::chrono::system_clock::time_point& time, Task task) {
         std::unique_lock<std::mutex> lock(mutex_);
-        auto it = tasks_.find(time);
-        if (it != tasks_.end()) {
-            tasks_.erase(it);
+        auto range = tasks_.equal_range(time);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second.target_type() == task.target_type()) {
+                tasks_.erase(it);
+                break;
+            }
         }
     }
 
@@ -51,7 +55,7 @@ public:
 private:
     void run() {
         while (true) {
-            Task task_to_run;
+            std::vector<Task> tasks_to_run;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 if (tasks_.empty()) {
@@ -60,28 +64,33 @@ private:
 
                 if (stop_) break;
 
-                auto it = tasks_.begin();
                 auto now = std::chrono::system_clock::now();
-                if (now >= it->first) {
-                    task_to_run = it->second;
-                    tasks_.erase(it);
-                } else {
-                    cond_var_.wait_until(lock, it->first);
+                auto it = tasks_.begin();
+                while (it != tasks_.end() && it->first <= now) {
+                    tasks_to_run.push_back(it->second);
+                    it = tasks_.erase(it);
+                }
+
+                if (tasks_.empty() && !stop_) {
+                    cond_var_.wait(lock);
+                } else if (!tasks_.empty()) {
+                    cond_var_.wait_until(lock, tasks_.begin()->first);
                 }
             }
-            if (task_to_run) {
-                task_to_run();
+            for (const auto& task : tasks_to_run) {
+                task();
             }
         }
     }
 
-    std::map<std::chrono::system_clock::time_point, Task> tasks_;
+    std::multimap<std::chrono::system_clock::time_point, Task> tasks_;
     std::thread scheduler_thread_;
     std::mutex mutex_;
     std::condition_variable cond_var_;
     std::atomic<bool> stop_;
 };
 
+// 示例任务函数
 void example_task() {
     std::cout << "Task executed at: "
               << std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
@@ -94,6 +103,11 @@ int main() {
 
     auto time_point = std::chrono::system_clock::now() + std::chrono::seconds(5);
     scheduler.add_task(time_point, example_task);
+    scheduler.add_task(time_point, [] {
+        std::cout << "Another task executed at: "
+                  << std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
+                  << std::endl;
+    });
 
     std::this_thread::sleep_for(std::chrono::seconds(10));
     scheduler.stop();
